@@ -5,20 +5,6 @@ from telegram import Update, ForceReply, ChatMember, ChatMemberAdministrator, Ch
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ChatMemberHandler
 import datetime
 import re
-import json
-
-# Firebase Imports (handled by Canvas environment)
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-    from firebase_admin.auth import get_auth, signInAnonymously, signInWithCustomToken, on_auth_state_changed
-except ImportError:
-    # This block will execute if firebase_admin is not installed.
-    # It's here for local testing guidance, but in Canvas, it should always be available.
-    print("firebase_admin library not found. Please install it: pip install firebase-admin")
-    firebase_admin = None
-    firestore = None
-    credentials = None
 
 # Enable logging
 logging.basicConfig(
@@ -27,14 +13,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-# IMPORTANT: Replace 'YOUR_BOT_TOKEN' with your actual bot token provided by BotFather.
-# The user provided token is 7598946589:AAHNOuwJps7wSn26HiNlUSqggBY_28ChnxU
 BOT_TOKEN = "7598946589:AAHNOuwJps7wSn26HiNlUSqggBY_28ChnxU"
 
-# Global Firestore instances
-db = None
-auth = None
-app_id = None # Will be set from __app_id
+# --- In-memory Storage (Non-persistent) ---
+# Data stored here will be lost when the bot restarts.
+_group_settings = {} # Stores welcome messages and rules per chat_id: {chat_id: {'welcome_message': '...', 'rules_message': '...'}}
+_user_warnings = {}  # Stores warnings per chat_id and user_id: {chat_id: {user_id: [{'timestamp': '...', 'admin_id': '...', 'reason': '...'}]}}
+
 
 # --- Utility Functions ---
 
@@ -65,7 +50,7 @@ async def get_bot_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE
                 'can_restrict_members': bot_member.can_restrict_members,
                 'can_delete_messages': bot_member.can_delete_messages,
                 'can_pin_messages': bot_member.can_pin_messages,
-                'can_promote_members': bot_member.can_promote_members, # Not used yet but good to have
+                'can_promote_members': bot_member.can_promote_members,
             }
         return {'is_admin': False}
     except Exception as e:
@@ -90,53 +75,31 @@ def parse_duration(duration_str: str) -> datetime.timedelta | None:
         return datetime.timedelta(days=value)
     return None
 
-# --- Firestore Operations ---
+# --- In-memory Storage Functions ---
 
-async def get_group_settings(chat_id: int) -> dict:
-    """Retrieves group settings (welcome, rules) from Firestore."""
-    if not db or not app_id: return {}
-    doc_ref = db.collection('artifacts').document(app_id).collection('public').document('data').collection('group_settings').document(str(chat_id))
-    try:
-        doc = await doc_ref.get()
-        return doc.to_dict() if doc.exists else {}
-    except Exception as e:
-        logger.error(f"Error getting group settings for {chat_id}: {e}")
-        return {}
+def get_group_settings_in_memory(chat_id: int) -> dict:
+    """Retrieves group settings from in-memory storage."""
+    return _group_settings.get(chat_id, {})
 
-async def set_group_setting(chat_id: int, key: str, value: str | None) -> None:
-    """Sets a specific group setting in Firestore."""
-    if not db or not app_id: return
-    doc_ref = db.collection('artifacts').document(app_id).collection('public').document('data').collection('group_settings').document(str(chat_id))
-    try:
-        if value is None:
-            # If value is None, remove the field
-            update_data = {key: firestore.DELETE_FIELD}
-            await doc_ref.update(update_data)
-        else:
-            await doc_ref.set({key: value}, merge=True)
-    except Exception as e:
-        logger.error(f"Error setting group setting {key} for {chat_id}: {e}")
+def set_group_setting_in_memory(chat_id: int, key: str, value: str | None) -> None:
+    """Sets a specific group setting in in-memory storage."""
+    if chat_id not in _group_settings:
+        _group_settings[chat_id] = {}
+    if value is None:
+        if key in _group_settings[chat_id]:
+            del _group_settings[chat_id][key]
+    else:
+        _group_settings[chat_id][key] = value
 
-async def get_user_warnings(chat_id: int, user_id: int) -> list:
-    """Retrieves a user's warnings from Firestore."""
-    if not db or not app_id: return []
-    doc_ref = db.collection('artifacts').document(app_id).collection('public').document('data').collection('group_warnings').document(str(chat_id)).collection('users').document(str(user_id))
-    try:
-        doc = await doc_ref.get()
-        data = doc.to_dict()
-        return data.get('warnings', []) if data else []
-    except Exception as e:
-        logger.error(f"Error getting warnings for user {user_id} in chat {chat_id}: {e}")
-        return []
+def get_user_warnings_in_memory(chat_id: int, user_id: int) -> list:
+    """Retrieves a user's warnings from in-memory storage."""
+    return _user_warnings.get(chat_id, {}).get(user_id, [])
 
-async def update_user_warnings(chat_id: int, user_id: int, warnings: list) -> None:
-    """Updates a user's warnings in Firestore."""
-    if not db or not app_id: return
-    doc_ref = db.collection('artifacts').document(app_id).collection('public').document('data').collection('group_warnings').document(str(chat_id)).collection('users').document(str(user_id))
-    try:
-        await doc_ref.set({'warnings': warnings}, merge=True)
-    except Exception as e:
-        logger.error(f"Error updating warnings for user {user_id} in chat {chat_id}: {e}")
+def update_user_warnings_in_memory(chat_id: int, user_id: int, warnings: list) -> None:
+    """Updates a user's warnings in in-memory storage."""
+    if chat_id not in _user_warnings:
+        _user_warnings[chat_id] = {}
+    _user_warnings[chat_id][user_id] = warnings
 
 # --- Command Handlers ---
 
@@ -162,9 +125,9 @@ Hello! I'm an advanced group management bot. Here's what I can do:
 * /echo <text> - I will echo your text.
 
 *Moderation Commands (Admin Only):*
-* /warn <reply to a message> - Warn the replied user.
-* /unwarn <reply to a message> - Remove a warn from the replied user.
-* /warnings <reply to a message> - Check a user's warnings.
+* /warn <reply to a message> - Warn the replied user. (Warnings are reset when bot restarts)
+* /unwarn <reply to a message> - Remove a warn from the replied user. (Warnings are reset when bot restarts)
+* /warnings <reply to a message> - Check a user's warnings. (Warnings are reset when bot restarts)
 * /mute <reply to a message> [duration e.g., 1h, 30m, 1d] - Mute a user.
 * /unmute <reply to a message> - Unmute a user.
 * /kick <reply to a message> - Kick the replied user.
@@ -175,10 +138,10 @@ Hello! I'm an advanced group management bot. Here's what I can do:
 * /unpin - Unpin the current pinned message.
 
 *Group Management Commands (Admin Only):*
-* /setwelcome <text> - Set a custom welcome message for new members.
-* /delwelcome - Delete the custom welcome message.
-* /rules <text> - Set group rules.
-* /rules - Get current group rules.
+* /setwelcome <text> - Set a custom welcome message for new members. (Resets when bot restarts)
+* /delwelcome - Delete the custom welcome message. (Resets when bot restarts)
+* /rules <text> - Set group rules. (Resets when bot restarts)
+* /getrules - Get current group rules. (Resets when bot restarts)
 * /info <reply to a message> - Get user info.
 * /chatinfo - Get current chat info.
 * /report <reply to a message> - Report a message to admins.
@@ -192,6 +155,8 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     about_text = """
 I am an advanced Telegram group management bot, built to help you moderate and manage your groups effectively.
 My features include moderation tools (warn, mute, ban), group settings (welcome, rules), and utility commands.
+
+Please note that welcome messages, rules, and warnings are currently stored in memory and will be reset if the bot restarts.
 
 I am constantly being improved with new functionalities!
 Developed by Gemini Bot.
@@ -259,7 +224,7 @@ async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Error kicking user {user_to_kick.id} from chat {chat.id}: {e}")
 
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Warns a user and stores the warning."""
+    """Warns a user and stores the warning in-memory."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -285,19 +250,19 @@ async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     reason = " ".join(context.args) if context.args else "No reason specified."
     
-    warnings = await get_user_warnings(chat.id, user_to_warn.id)
+    warnings = get_user_warnings_in_memory(chat.id, user_to_warn.id)
     warnings.append({
         'timestamp': datetime.datetime.now().isoformat(),
         'admin_id': update.effective_user.id,
         'reason': reason
     })
-    await update_user_warnings(chat.id, user_to_warn.id, warnings)
+    update_user_warnings_in_memory(chat.id, user_to_warn.id, warnings)
 
     await message.reply_text(f"{user_to_warn.full_name} has been warned. Total warnings: {len(warnings)}.\nReason: {reason}")
     logger.info(f"Warned user {user_to_warn.id} in chat {chat.id}. Reason: {reason}")
 
 async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Removes a warning from a user."""
+    """Removes a warning from a user (in-memory)."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -314,7 +279,7 @@ async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_to_unwarn = message.reply_to_message.from_user
-    warnings = await get_user_warnings(chat.id, user_to_unwarn.id)
+    warnings = get_user_warnings_in_memory(chat.id, user_to_unwarn.id)
 
     if not warnings:
         await message.reply_text(f"{user_to_unwarn.full_name} has no warnings.")
@@ -322,13 +287,13 @@ async def unwarn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Remove the most recent warning
     warnings.pop()
-    await update_user_warnings(chat.id, user_to_unwarn.id, warnings)
+    update_user_warnings_in_memory(chat.id, user_to_unwarn.id, warnings)
 
     await message.reply_text(f"One warning removed for {user_to_unwarn.full_name}. Total warnings: {len(warnings)}.")
     logger.info(f"Unwarned user {user_to_unwarn.id} in chat {chat.id}.")
 
 async def check_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Checks and displays a user's warnings."""
+    """Checks and displays a user's warnings (from in-memory)."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -345,7 +310,7 @@ async def check_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_to_check = message.reply_to_message.from_user
-    warnings = await get_user_warnings(chat.id, user_to_check.id)
+    warnings = get_user_warnings_in_memory(chat.id, user_to_check.id)
 
     if not warnings:
         await message.reply_text(f"{user_to_check.full_name} has no warnings.")
@@ -412,7 +377,7 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             'can_send_video_notes': False,
             'can_send_voice_notes': False,
             'can_send_polls': False,
-            'can_send_other_messages': False, # This usually covers stickers, gifs, etc.
+            'can_send_other_messages': False,
             'can_add_web_page_previews': False,
             'can_change_info': False,
             'can_invite_users': False,
@@ -557,7 +522,6 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        # Use only_if_banned=True to prevent errors if user is not banned
         await chat.unban_member(user_id_to_unban, only_if_banned=True)
         await message.reply_text(f"Successfully unbanned user with ID `{user_id_to_unban}`.")
         logger.info(f"Unbanned user {user_id_to_unban} from chat {chat.id}")
@@ -658,7 +622,7 @@ async def unpin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.error(f"Error unpinning messages in chat {chat.id}: {e}")
 
 async def set_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sets a custom welcome message for the group."""
+    """Sets a custom welcome message for the group (in-memory)."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -678,12 +642,12 @@ async def set_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     welcome_text = " ".join(context.args)
-    await set_group_setting(chat.id, 'welcome_message', welcome_text)
-    await message.reply_text("Welcome message set successfully!")
+    set_group_setting_in_memory(chat.id, 'welcome_message', welcome_text)
+    await message.reply_text("Welcome message set successfully! (Note: This is reset if the bot restarts)")
     logger.info(f"Set welcome message for chat {chat.id}")
 
 async def delete_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Deletes the custom welcome message."""
+    """Deletes the custom welcome message (from in-memory)."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -695,14 +659,14 @@ async def delete_welcome_message(update: Update, context: ContextTypes.DEFAULT_T
         await message.reply_text("You must be an admin to use this command.")
         return
 
-    await set_group_setting(chat.id, 'welcome_message', None) # Set to None to delete
-    await message.reply_text("Welcome message deleted successfully!")
+    set_group_setting_in_memory(chat.id, 'welcome_message', None) # Set to None to delete
+    await message.reply_text("Welcome message deleted successfully! (Note: This is reset if the bot restarts)")
     logger.info(f"Deleted welcome message for chat {chat.id}")
 
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Greets new members using a custom welcome message if set."""
+    """Greets new members using a custom welcome message if set (from in-memory)."""
     chat = update.effective_chat
-    settings = await get_group_settings(chat.id)
+    settings = get_group_settings_in_memory(chat.id)
     welcome_message_template = settings.get('welcome_message')
 
     for member in update.message.new_chat_members:
@@ -716,7 +680,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.info(f"Welcomed new member {member.id} to chat {chat.id}")
 
 async def set_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sets the group rules."""
+    """Sets the group rules (in-memory)."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -733,12 +697,12 @@ async def set_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     rules_text = " ".join(context.args)
-    await set_group_setting(chat.id, 'rules_message', rules_text)
-    await message.reply_text("Group rules set successfully!")
+    set_group_setting_in_memory(chat.id, 'rules_message', rules_text)
+    await message.reply_text("Group rules set successfully! (Note: This is reset if the bot restarts)")
     logger.info(f"Set rules for chat {chat.id}")
 
 async def get_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Displays the current group rules."""
+    """Displays the current group rules (from in-memory)."""
     message = update.effective_message
     chat = update.effective_chat
 
@@ -746,7 +710,7 @@ async def get_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("This command can only be used in a group.")
         return
 
-    settings = await get_group_settings(chat.id)
+    settings = get_group_settings_in_memory(chat.id)
     rules_message = settings.get('rules_message')
 
     if rules_message:
@@ -877,54 +841,7 @@ async def report_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     """Start the bot."""
-    global db, auth, app_id
-
-    # Initialize Firebase if not already initialized
-    # These global variables are provided by the Canvas environment.
-    # We must ensure they are accessed safely.
-    firebase_config = json.loads(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}')
-    app_id = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'
-
-    if not firebase_admin._apps:
-        try:
-            # The 'options' dictionary is part of the firebase_admin.credentials.Certificate class
-            # but here we initialize with the firebaseConfig directly, which firebase_admin.initializeApp expects.
-            # No need for a separate credentials object if firebaseConfig directly contains project_id etc.
-            firebase_admin.initializeApp(firebase_config)
-            db = firestore.client()
-            auth = get_auth()
-            logger.info("Firebase initialized.")
-
-            # Authenticate anonymously or with custom token
-            # This is crucial for Firestore security rules to allow access
-            async def auth_listener(user_record):
-                if user_record:
-                    logger.info(f"Authenticated as user: {user_record.uid}")
-                else:
-                    logger.info("Authentication state changed: user signed out or not authenticated.")
-
-            # Await the initial authentication for the bot instance
-            async def authenticate_bot():
-                try:
-                    if typeof __initial_auth_token !== 'undefined' and __initial_auth_token:
-                        await signInWithCustomToken(auth, __initial_auth_token)
-                        logger.info("Signed in with custom token.")
-                    else:
-                        await signInAnonymously(auth)
-                        logger.info("Signed in anonymously.")
-                except Exception as e:
-                    logger.error(f"Firebase authentication failed: {e}")
-                    # Handle authentication failure, maybe exit or retry
-            
-            # Run this async function to ensure authentication completes before bot starts polling
-            import asyncio
-            asyncio.run(authenticate_bot())
-
-        except Exception as e:
-            logger.error(f"Failed to initialize Firebase: {e}")
-            # If Firebase fails to initialize, the bot might not work correctly.
-            # You might want to exit here or run with limited functionality.
-
+    
     # Create the Application and pass your bot's token.
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -952,11 +869,10 @@ def main() -> None:
     application.add_handler(CommandHandler("setwelcome", set_welcome_message))
     application.add_handler(CommandHandler("delwelcome", delete_welcome_message))
     application.add_handler(CommandHandler("rules", set_rules))
-    application.add_handler(CommandHandler("getrules", get_rules)) # Added explicit command for clarity
+    application.add_handler(CommandHandler("getrules", get_rules))
     application.add_handler(CommandHandler("info", get_user_info))
     application.add_handler(CommandHandler("chatinfo", get_chat_info))
     application.add_handler(CommandHandler("report", report_message))
-
 
     # On new members joining - add handler
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
