@@ -1,109 +1,108 @@
-import os
+# main.py
+
 import logging
-from dotenv import load_dotenv
+from telegram import Update, ForceReply, ChatMember
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ChatMemberHandler
 
-import google.generativeai as genai
-
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Configure logging
+# Enable logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-TELEGRAM_BOT_TOKEN = os.getenv("7347273926:AAH2M1LDzSQoibf1VH0BMQrkFSfcX6qedlo")
-GEMINI_API_KEY = os.getenv("AIzaSyCT_hRShR7x-luU4bMCNCTj9vunETcOqGk")
-GEMINI_MODEL_NAME = "gemini-1.5-flash" # Or "gemini-2.0-flash" if available and preferred, check Google AI Studio documentation for latest model names
+# IMPORTANT: Replace 'YOUR_BOT_TOKEN' with your actual bot token provided by BotFather.
+# The user provided token is 7598946589:AAHNOuwJps7wSn26HiNlUSqggBY_28ChnxU
+BOT_TOKEN = "7598946589:AAHNOuwJps7wSn26HiNlUSqggBY_28ChnxU"
 
-# Initialize Gemini
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env file. Please set it up.")
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-
-# --- Telegram Bot Handlers ---
+# --- Command Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the /start command is issued."""
+    """Sends a welcome message when the command /start is issued."""
     user = update.effective_user
     await update.message.reply_html(
-        f"Hello {user.mention_html()}! I'm your Gemini-powered chatbot. Ask me anything!"
+        f"Hi {user.mention_html()}! I'm your group management bot. "
+        "Use /help to see what I can do.",
+        reply_markup=ForceReply(selective=True),
     )
-    logger.info(f"User {user.full_name} started the bot.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a help message when the /help command is issued."""
+    """Sends a message with available commands when the command /help is issued."""
     help_text = """
-    *Welcome to the Gemini AI Chatbot!*
+Hello! I'm a simple group management bot. Here's what I can do:
 
-    I can answer your questions and generate creative text using Google's Gemini 1.5 Flash model.
+* /start - Greet me!
+* /help - Show this help message.
+* /kick <reply to a message> - Kick the replied user from the group.
+    (Note: I need to be an admin in the group with 'Ban users' permission for this to work.)
 
-    *Commands:*
-    /start - Start interacting with the bot.
-    /help - Show this help message.
-    /clear - Clear the current conversation history (for multi-turn conversations).
-
-    *How to use:*
-    Just type your question or prompt, and I'll do my best to respond!
+More features will be added soon!
     """
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-    logger.info(f"User {update.effective_user.full_name} requested help.")
+    await update.message.reply_text(help_text)
 
-async def clear_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clears the conversation history for a user."""
-    # This example doesn't store per-user history, but if you were building
-    # a more complex multi-turn bot, you would reset the history here.
-    await update.message.reply_text("Conversation history cleared!")
-    logger.info(f"User {update.effective_user.full_name} cleared conversation.")
+async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kicks a user from the group. Requires bot to be an admin with ban rights."""
+    message = update.effective_message
+    chat = update.effective_chat
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming text messages and sends them to Gemini for a response."""
-    user_message = update.message.text
-    user = update.effective_user
+    if not chat.type == 'group' and not chat.type == 'supergroup':
+        await message.reply_text("This command can only be used in a group.")
+        return
 
-    logger.info(f"User {user.full_name} ({user.id}) sent message: {user_message}")
+    if not message.reply_to_message:
+        await message.reply_text("Please reply to the message of the user you want to kick.")
+        return
+
+    user_to_kick = message.reply_to_message.from_user
+
+    # Check if the bot has admin rights to kick users
+    bot_member = await chat.get_member(context.bot.id)
+    if not bot_member.status == ChatMember.ADMINISTRATOR or not bot_member.can_restrict_members:
+        await message.reply_text(
+            "I need to be an admin in this group with 'Ban users' permission to kick members."
+        )
+        return
 
     try:
-        # Show typing status
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-        # Send message to Gemini 2.0 Flash
-        # For multi-turn conversations, you would maintain a chat session.
-        # This example treats each message as a new prompt for simplicity,
-        # but you can implement conversation history using `model.start_chat()`.
-        response = model.generate_content(user_message)
-
-        # Get the text response
-        gemini_response_text = response.text
-
-        # Send the Gemini response back to Telegram
-        await update.message.reply_text(gemini_response_text)
-        logger.info(f"Sent response to user {user.full_name}: {gemini_response_text[:100]}...") # Log first 100 chars
+        await chat.ban_member(user_to_kick.id)
+        await message.reply_text(f"Successfully kicked {user_to_kick.full_name}.")
+        logger.info(f"Kicked user {user_to_kick.id} from chat {chat.id}")
     except Exception as e:
-        logger.error(f"Error processing message from {user.full_name}: {e}")
-        await update.message.reply_text("Oops! Something went wrong while processing your request. Please try again later.")
+        await message.reply_text(f"Failed to kick {user_to_kick.full_name}. Error: {e}")
+        logger.error(f"Error kicking user {user_to_kick.id} from chat {chat.id}: {e}")
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Greets new members when they join the group."""
+    for member in update.message.new_chat_members:
+        if not member.is_bot:
+            await update.message.reply_text(f"Welcome, {member.full_name}! 👋")
+            logger.info(f"Welcomed new member {member.id} to chat {update.effective_chat.id}")
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Echoes the user message. This is just for demonstration."""
+    # This handler is intentionally kept simple for a group management bot.
+    # You might want to remove or modify it based on your bot's purpose.
+    # await update.message.reply_text(update.message.text)
+    pass # Do nothing for now, as it's a group management bot.
 
 def main() -> None:
-    """Starts the bot."""
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN not found in .env file. Please set it up.")
+    """Start the bot."""
+    # Create the Application and pass your bot's token.
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Register handlers
+    # On different commands - add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("clear", clear_conversation))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    application.add_handler(CommandHandler("kick", kick_user))
 
-    logger.info("Bot is polling...")
+    # On new members joining - add handler
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
+
+    # On non-command messages - echo the message (optional, usually not needed for management bots)
+    # application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Run the bot until the user presses Ctrl-C
+    logger.info("Bot started! Press Ctrl-C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
